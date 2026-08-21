@@ -30,7 +30,9 @@ CLASS_CONFIDENCE_THRESHOLDS = {
     "snake": 0.60,
     "slime": 0.8,
     "neso": 0.20,
-    "player": 0.60,
+    # Direction changes briefly distort the player sprite and tend to lower
+    # its confidence. Identity is still protected by OCR and spatial tracking.
+    "player": 0.45,
     "platform": 0.25,
     "rope": 0.10,
 }
@@ -44,8 +46,28 @@ TERMINAL_STATUS_INTERVAL = 1.0
 OCR_INTERVAL = 0.25
 OCR_CONFIDENCE = 0.60
 OCR_FONT_PATH = Path("C:/Windows/Fonts/msjhbd.ttc")
-MY_PLAYER_NAME = "阿罵的手機"
+MY_PLAYER_NAME = "黑暗打法師"
 NAME_MATCH_THRESHOLD = 0.80
+
+# Pixel templates for identifying the local player's eyes whenever the name
+# below the character is obscured by platform grass.
+PLAYER_EYE_TEMPLATE_DIRECTORY = ROOT / "character"
+PLAYER_EYE_MATCH_THRESHOLD = 0.88
+PLAYER_EYE_MAX_MEAN_COLOR_ERROR = 45.0
+PLAYER_EYE_AMBIGUITY_MARGIN = 0.08
+PLAYER_EYE_SEARCH_MARGIN = 4
+PLAYER_EYE_SEARCH_HEIGHT_RATIO = 0.72
+
+# Keep the local player stable through the few missed detections commonly
+# caused by rapidly alternating LEFT/RIGHT. OCR remains the authoritative
+# identity source; these values only bridge short gaps between OCR matches.
+PLAYER_TRACK_MAX_MATCH_DISTANCE = 140
+PLAYER_TRACK_MAX_VERTICAL_DISTANCE = 90
+PLAYER_TRACK_AMBIGUITY_MARGIN = 20
+PLAYER_TRACK_MISSING_GRACE_DURATION = 0.50
+PLAYER_TRACK_RESET_DURATION = 2.00
+PLAYER_TRACK_PREDICTION_HORIZON = 0.15
+PLAYER_TRACK_VELOCITY_SMOOTHING = 0.60
 
 # Jump until the player's initially obscured name can be identified by OCR.
 PLAYER_DISCOVERY_JUMP_ENABLED = True
@@ -837,6 +859,141 @@ class ScrollMatch:
     score: float
 
 
+@dataclass(frozen=True)
+class PlayerEyeTemplate:
+    name: str
+    image: np.ndarray
+
+
+@dataclass(frozen=True)
+class PlayerEyeMatch:
+    player_index: int
+    template_name: str
+    score: float
+    mean_color_error: float
+    coordinates: tuple[int, int, int, int]
+
+
+def load_player_eye_templates(
+    directory: Path,
+) -> list[PlayerEyeTemplate]:
+    templates = []
+    for path in sorted(directory.glob("*.png")):
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None or image.ndim != 3 or image.shape[2] != 3:
+            raise RuntimeError(f"Unable to load player-eye template: {path}")
+        if image.shape[0] < 3 or image.shape[1] < 3:
+            raise ValueError(f"Player-eye template is too small: {path}")
+        templates.append(PlayerEyeTemplate(path.stem, image))
+    if not templates:
+        raise RuntimeError(
+            f"No player-eye PNG templates found in: {directory}"
+        )
+    return templates
+
+
+def find_player_eye_match(
+    frame: np.ndarray,
+    player_boxes,
+    templates: list[PlayerEyeTemplate],
+) -> PlayerEyeMatch | None:
+    """Find the eye template inside one unambiguous YOLO player box."""
+    frame_height, frame_width = frame.shape[:2]
+    player_matches: list[PlayerEyeMatch] = []
+
+    for player_index, player_box in enumerate(player_boxes):
+        x1, y1, x2, y2 = map(float, player_box.xyxy[0])
+        box_height = max(1.0, y2 - y1)
+        search_x1 = max(0, int(x1) - PLAYER_EYE_SEARCH_MARGIN)
+        search_y1 = max(0, int(y1) - PLAYER_EYE_SEARCH_MARGIN)
+        search_x2 = min(frame_width, int(x2) + PLAYER_EYE_SEARCH_MARGIN + 1)
+        search_y2 = min(
+            frame_height,
+            int(y1 + box_height * PLAYER_EYE_SEARCH_HEIGHT_RATIO)
+            + PLAYER_EYE_SEARCH_MARGIN
+            + 1,
+        )
+        search = frame[search_y1:search_y2, search_x1:search_x2]
+        if search.size == 0:
+            continue
+
+        best_player_match: PlayerEyeMatch | None = None
+        for template in templates:
+            template_height, template_width = template.image.shape[:2]
+            if (
+                search.shape[0] < template_height
+                or search.shape[1] < template_width
+            ):
+                continue
+
+            scores = cv2.matchTemplate(
+                search,
+                template.image,
+                cv2.TM_CCOEFF_NORMED,
+            )
+            scores = np.nan_to_num(
+                scores,
+                nan=-1.0,
+                posinf=-1.0,
+                neginf=-1.0,
+            )
+            _minimum, score, _minimum_location, location = cv2.minMaxLoc(scores)
+            local_x, local_y = location
+            patch = search[
+                local_y : local_y + template_height,
+                local_x : local_x + template_width,
+            ]
+            mean_color_error = float(
+                np.abs(
+                    patch.astype(np.int16) - template.image.astype(np.int16)
+                ).mean()
+            )
+            if (
+                score < PLAYER_EYE_MATCH_THRESHOLD
+                or mean_color_error > PLAYER_EYE_MAX_MEAN_COLOR_ERROR
+            ):
+                continue
+
+            match = PlayerEyeMatch(
+                player_index=player_index,
+                template_name=template.name,
+                score=float(score),
+                mean_color_error=mean_color_error,
+                coordinates=(
+                    search_x1 + local_x,
+                    search_y1 + local_y,
+                    search_x1 + local_x + template_width,
+                    search_y1 + local_y + template_height,
+                ),
+            )
+            if (
+                best_player_match is None
+                or match.score > best_player_match.score
+                or (
+                    match.score == best_player_match.score
+                    and match.mean_color_error
+                    < best_player_match.mean_color_error
+                )
+            ):
+                best_player_match = match
+
+        if best_player_match is not None:
+            player_matches.append(best_player_match)
+
+    player_matches.sort(
+        key=lambda match: (-match.score, match.mean_color_error)
+    )
+    if not player_matches:
+        return None
+    if (
+        len(player_matches) >= 2
+        and player_matches[0].score - player_matches[1].score
+        < PLAYER_EYE_AMBIGUITY_MARGIN
+    ):
+        return None
+    return player_matches[0]
+
+
 def load_scroll_templates(directory: Path) -> list[ScrollTemplate]:
     templates = []
     for path in sorted(directory.glob("*.png")):
@@ -1111,6 +1268,155 @@ def is_my_player_name(text: str) -> bool:
 def player_box_center(player_box) -> tuple[float, float]:
     x1, y1, x2, y2 = map(float, player_box.xyxy[0])
     return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+class PlayerTracker:
+    """Track the OCR-identified player across short YOLO detection gaps."""
+
+    def __init__(self) -> None:
+        self.center: tuple[float, float] | None = None
+        self.coordinates: tuple[int, int, int, int] | None = None
+        self.velocity = (0.0, 0.0)
+        self.last_seen_at: float | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self.center is not None
+
+    def reset(self) -> None:
+        self.center = None
+        self.coordinates = None
+        self.velocity = (0.0, 0.0)
+        self.last_seen_at = None
+
+    def update(
+        self,
+        player_boxes,
+        now: float,
+        identity_index: int | None,
+    ) -> tuple[int | None, tuple[int, int, int, int] | None]:
+        """Return the matched detection index and usable player coordinates.
+
+        A missing detection returns the last reliable box for a very short
+        grace period. This prevents one bad animation frame from making the
+        navigation controller believe the player vanished.
+        """
+        box_coordinates = [
+            tuple(int(value) for value in box.xyxy[0])
+            for box in player_boxes
+        ]
+
+        if identity_index is not None and 0 <= identity_index < len(player_boxes):
+            self._accept(
+                player_box_center(player_boxes[identity_index]),
+                box_coordinates[identity_index],
+                now,
+            )
+            return identity_index, self.coordinates
+
+        if self.center is None or self.last_seen_at is None:
+            return None, None
+
+        missing_duration = max(0.0, now - self.last_seen_at)
+        if missing_duration > PLAYER_TRACK_RESET_DURATION:
+            self.reset()
+            return None, None
+
+        predicted_duration = min(
+            missing_duration,
+            PLAYER_TRACK_PREDICTION_HORIZON,
+        )
+        predicted_center = (
+            self.center[0] + self.velocity[0] * predicted_duration,
+            self.center[1] + self.velocity[1] * predicted_duration,
+        )
+        speed = hypot(*self.velocity)
+        allowed_distance = PLAYER_TRACK_MAX_MATCH_DISTANCE + min(
+            speed * missing_duration,
+            PLAYER_TRACK_MAX_MATCH_DISTANCE,
+        )
+
+        candidates: list[tuple[float, int, tuple[float, float]]] = []
+        for index, player_box in enumerate(player_boxes):
+            candidate_center = player_box_center(player_box)
+            current_distance = hypot(
+                candidate_center[0] - self.center[0],
+                candidate_center[1] - self.center[1],
+            )
+            predicted_distance = hypot(
+                candidate_center[0] - predicted_center[0],
+                candidate_center[1] - predicted_center[1],
+            )
+            vertical_distance = abs(candidate_center[1] - self.center[1])
+            if (
+                min(current_distance, predicted_distance) > allowed_distance
+                or vertical_distance > PLAYER_TRACK_MAX_VERTICAL_DISTANCE
+            ):
+                continue
+
+            # Retaining a contribution from the last observed center makes a
+            # sudden velocity reversal (LEFT -> RIGHT or vice versa) safe.
+            tracking_score = (
+                predicted_distance * 0.65 + current_distance * 0.35
+            )
+            candidates.append((tracking_score, index, candidate_center))
+
+        candidates.sort()
+        unambiguous = (
+            len(candidates) == 1
+            or (
+                len(candidates) >= 2
+                and candidates[1][0] - candidates[0][0]
+                >= PLAYER_TRACK_AMBIGUITY_MARGIN
+            )
+        )
+        if candidates and unambiguous:
+            _score, index, candidate_center = candidates[0]
+            self._accept(
+                candidate_center,
+                box_coordinates[index],
+                now,
+            )
+            return index, self.coordinates
+
+        if missing_duration <= PLAYER_TRACK_MISSING_GRACE_DURATION:
+            return None, self.coordinates
+        return None, None
+
+    def _accept(
+        self,
+        new_center: tuple[float, float],
+        new_coordinates: tuple[int, int, int, int],
+        now: float,
+    ) -> None:
+        if self.center is not None and self.last_seen_at is not None:
+            elapsed = now - self.last_seen_at
+            if 1e-3 < elapsed <= PLAYER_TRACK_RESET_DURATION:
+                measured_velocity = (
+                    (new_center[0] - self.center[0]) / elapsed,
+                    (new_center[1] - self.center[1]) / elapsed,
+                )
+                direction_reversed = (
+                    measured_velocity[0] * self.velocity[0] < 0
+                )
+                if direction_reversed:
+                    # Do not let momentum from the old direction pull the
+                    # prediction away when LEFT/RIGHT is switched rapidly.
+                    self.velocity = measured_velocity
+                else:
+                    smoothing = PLAYER_TRACK_VELOCITY_SMOOTHING
+                    self.velocity = (
+                        self.velocity[0] * smoothing
+                        + measured_velocity[0] * (1.0 - smoothing),
+                        self.velocity[1] * smoothing
+                        + measured_velocity[1] * (1.0 - smoothing),
+                    )
+        else:
+            self.velocity = (0.0, 0.0)
+
+        self.center = new_center
+        self.coordinates = new_coordinates
+        self.last_seen_at = now
 
 
 def coordinates_center(
@@ -2807,16 +3113,24 @@ def main() -> None:
     scroll_detector = ScrollDetector(
         load_scroll_templates(SCROLL_TEMPLATE_DIRECTORY)
     )
+    player_eye_templates = load_player_eye_templates(
+        PLAYER_EYE_TEMPLATE_DIRECTORY
+    )
     ocr = RapidOCR()
     ocr_font = ImageFont.truetype(str(OCR_FONT_PATH), 24)
     player_class_id = next(class_id for class_id, name in model.names.items() if name == "player")
+    print(
+        "Player identity: name OCR + eye template matching ("
+        + ", ".join(template.name for template in player_eye_templates)
+        + ")"
+    )
     ignored_class_ids = {
         class_id
         for class_id, name in model.names.items()
         if name in IGNORED_CLASS_NAMES
     }
     last_ocr_time = 0.0
-    self_center: tuple[float, float] | None = None
+    player_tracker = PlayerTracker()
     last_resource_ocr_time = 0.0
     last_terminal_status_time = float("-inf")
     hp_stat: tuple[int, int] | None = None
@@ -3024,6 +3338,7 @@ def main() -> None:
                 box for box in result.boxes if int(box.cls.item()) == player_class_id
             ]
             now = perf_counter()
+            ocr_self_index = None
             if player_boxes and now - last_ocr_time >= OCR_INTERVAL:
                 last_ocr_time = now
                 ocr_matches = []
@@ -3040,28 +3355,54 @@ def main() -> None:
                         ocr_matches.append((index, score))
 
                 if ocr_matches:
-                    if self_center is None:
+                    if player_tracker.center is None:
                         matched_index = max(ocr_matches, key=lambda item: item[1])[0]
                     else:
                         matched_index = min(
                             (index for index, _score in ocr_matches),
                             key=lambda index: (
-                                (player_box_center(player_boxes[index])[0] - self_center[0]) ** 2
-                                + (player_box_center(player_boxes[index])[1] - self_center[1]) ** 2
+                                (player_box_center(player_boxes[index])[0] - player_tracker.center[0]) ** 2
+                                + (player_box_center(player_boxes[index])[1] - player_tracker.center[1]) ** 2
                             ),
                         )
-                    self_center = player_box_center(player_boxes[matched_index])
+                    ocr_self_index = matched_index
 
-            self_index = None
-            if self_center is not None and player_boxes:
-                self_index = min(
-                    range(len(player_boxes)),
-                    key=lambda index: (
-                        (player_box_center(player_boxes[index])[0] - self_center[0]) ** 2
-                        + (player_box_center(player_boxes[index])[1] - self_center[1]) ** 2
-                    ),
+            eye_match = (
+                None
+                if ocr_self_index is not None
+                else find_player_eye_match(
+                    frame,
+                    player_boxes,
+                    player_eye_templates,
                 )
-                self_center = player_box_center(player_boxes[self_index])
+            )
+            identity_self_index = (
+                ocr_self_index
+                if ocr_self_index is not None
+                else (
+                    None
+                    if eye_match is None
+                    else eye_match.player_index
+                )
+            )
+            self_index, tracked_player_coordinates = player_tracker.update(
+                player_boxes,
+                now,
+                identity_self_index,
+            )
+            if ocr_self_index is not None:
+                player_identity_status = "NAME OCR"
+            elif eye_match is not None:
+                player_identity_status = (
+                    f"EYE {eye_match.template_name} "
+                    f"{eye_match.score:.2f}"
+                )
+            elif self_index is not None:
+                player_identity_status = "TRACK"
+            elif tracked_player_coordinates is not None:
+                player_identity_status = "TRACK GRACE"
+            else:
+                player_identity_status = "NOT FOUND"
 
             player_labels = []
             for index, player_box in enumerate(player_boxes):
@@ -3085,11 +3426,7 @@ def main() -> None:
                     elif class_name == "rope":
                         rope_boxes.append(coordinates)
 
-            self_coordinates = (
-                None
-                if self_index is None
-                else player_labels[self_index][0]
-            )
+            self_coordinates = tracked_player_coordinates
             player_position = (
                 None
                 if self_coordinates is None
@@ -3100,7 +3437,7 @@ def main() -> None:
             )
 
             player_discovery_active = (
-                PLAYER_DISCOVERY_JUMP_ENABLED and self_center is None
+                PLAYER_DISCOVERY_JUMP_ENABLED and not player_tracker.acquired
             )
             discovery_now = perf_counter()
             if (
@@ -3310,7 +3647,8 @@ def main() -> None:
                         if player_position is None
                         else (
                             f"PLAYER CENTER: "
-                            f"({player_position[0]}, {player_position[1]})"
+                            f"({player_position[0]}, {player_position[1]}) "
+                            f"[{player_identity_status}]"
                         )
                     )
                     cv2.putText(
@@ -3351,6 +3689,25 @@ def main() -> None:
                     player_labels,
                     ocr_font,
                 )
+                if eye_match is not None:
+                    eye_x1, eye_y1, eye_x2, eye_y2 = eye_match.coordinates
+                    cv2.rectangle(
+                        annotated,
+                        (eye_x1, eye_y1),
+                        (eye_x2, eye_y2),
+                        (255, 0, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        annotated,
+                        f"EYE {eye_match.score:.2f}",
+                        (eye_x1, max(15, eye_y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        (255, 0, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
                 cv2.imshow(preview_title, annotated)
 
                 key = cv2.waitKey(1) & 0xFF
@@ -3388,7 +3745,8 @@ def main() -> None:
                             if player_position is None
                             else (
                                 f" | PLAYER: "
-                                f"({player_position[0]}, {player_position[1]})"
+                                f"({player_position[0]}, {player_position[1]}) "
+                                f"[{player_identity_status}]"
                             )
                         )
                     )
