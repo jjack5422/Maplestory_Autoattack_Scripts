@@ -126,11 +126,15 @@ COIN_SAME_LEVEL_FEET_TOLERANCE = 50
 COIN_DETECTION_GRACE_DURATION = 0.75
 UPPER_COIN_REVERSE_SEARCH_DURATION = 5.0
 COIN_TARGET_LOST_GRACE_DURATION = 1.0
-COIN_TARGET_BLIND_PURSUIT_MAX_DURATION = 3.0
+COIN_TARGET_BLIND_PURSUIT_MAX_DURATION = 1.20
 COIN_DIRECTION_LOCK_DURATION = 1.0
+COIN_DIRECTION_REVERSAL_DISTANCE = 60
+COIN_DIRECTION_CONFIRM_DURATION = 0.20
 COIN_PICKUP_PASS_DURATION = 0.40
+COIN_PICKUP_CONFIRM_MISSING_DURATION = 0.60
+COIN_PICKUP_PASS_MAX_DURATION = 1.20
 COIN_TARGET_MATCH_DISTANCE = 120
-COIN_REACQUIRE_COOLDOWN = 0.75
+COIN_REACQUIRE_COOLDOWN = 1.50
 COIN_REACQUIRE_IGNORE_DISTANCE = 80
 
 ROPE_FINE_ALIGNMENT_DISTANCE = 30
@@ -169,6 +173,21 @@ HP_ROI_OFFSETS = (-183, -104, -35, -15)
 MP_ROI_OFFSETS = (-73, 7, -35, -15)
 RESOURCE_OCR_SCALE = 5
 DIRECTINPUT_KEY_HOLD = 0.060
+
+KEY_BINDINGS: tuple[tuple[str, str], ...] = (
+    ("Z", "撿取物品，每 0.15 秒"),
+    ("Q", "攻擊 slime，每 0.5 秒最多一次"),
+    ("W", "攻擊 snake，每 0.5 秒最多一次"),
+    ("S", "Buff，每 275 秒；每隔 0.2 秒按一次，共 5 次"),
+    ("E", "HP ≤ 300 時補血，每 0.25 秒"),
+    ("1", "按 E 一秒後 HP 仍未超過 300 時使用"),
+    ("2", "缺少 MP 超過 1000 時使用"),
+    ("LEFT", "向左移動及調整攻擊方向"),
+    ("RIGHT", "向右移動及調整攻擊方向"),
+    ("UP", "向上攀爬繩索"),
+    ("DOWN", "準備向下跳平台"),
+    ("ALT", "跳躍、爬繩及下跳"),
+)
 
 # Hunt/rest cycle hyperparameters. Mouse positions are absolute screen coordinates.
 HUNT_DURATION_MINUTES = 30
@@ -1541,6 +1560,8 @@ class TwoLayerCombatController:
         self.coin_target_started_at: float | None = None
         self.coin_target_last_seen_at = float("-inf")
         self.coin_pickup_pass_started_at: float | None = None
+        self.coin_direction_candidate: str | None = None
+        self.coin_direction_candidate_started_at: float | None = None
         self.recently_passed_coin: tuple[int, int, int, int] | None = None
         self.coin_reacquire_block_until = float("-inf")
 
@@ -1632,6 +1653,8 @@ class TwoLayerCombatController:
         self.coin_target_started_at = None
         self.coin_target_last_seen_at = float("-inf")
         self.coin_pickup_pass_started_at = None
+        self.coin_direction_candidate = None
+        self.coin_direction_candidate_started_at = None
         if clear_recent:
             self.recently_passed_coin = None
             self.coin_reacquire_block_until = float("-inf")
@@ -1647,6 +1670,8 @@ class TwoLayerCombatController:
         self.coin_target_started_at = now
         self.coin_target_last_seen_at = now
         self.coin_pickup_pass_started_at = None
+        self.coin_direction_candidate = None
+        self.coin_direction_candidate_started_at = None
 
     def available_coin_targets(
         self,
@@ -1690,7 +1715,11 @@ class TwoLayerCombatController:
             return None
         return matched
 
-    def continue_coin_pickup_pass(self, now: float) -> str | None:
+    def continue_coin_pickup_pass(
+        self,
+        now: float,
+        visible_coins: list[tuple[tuple[int, int, int, int], str]],
+    ) -> str | None:
         if (
             self.coin_pickup_pass_started_at is None
             or self.coin_target_direction is None
@@ -1699,13 +1728,30 @@ class TwoLayerCombatController:
 
         elapsed = now - self.coin_pickup_pass_started_at
         direction = self.coin_target_direction
-        if elapsed < COIN_PICKUP_PASS_DURATION:
+        visible_target = self.match_locked_coin(visible_coins)
+        if visible_target is not None:
+            self.coin_target_coordinates = visible_target[0]
+            self.coin_target_last_seen_at = now
+
+        missing_for = now - self.coin_target_last_seen_at
+        minimum_pass_complete = elapsed >= COIN_PICKUP_PASS_DURATION
+        disappearance_confirmed = (
+            visible_target is None
+            and missing_for >= COIN_PICKUP_CONFIRM_MISSING_DURATION
+        )
+        maximum_pass_reached = elapsed >= COIN_PICKUP_PASS_MAX_DURATION
+        if not (
+            minimum_pass_complete
+            and (disappearance_confirmed or maximum_pass_reached)
+        ):
             self.set_walking_direction(now, direction)
             self.facing_direction = direction
             self.set_state("coin_pickup_pass", now)
             return (
                 f"NESO: PICKUP PASS {direction.upper()} "
-                f"{elapsed:.1f}/{COIN_PICKUP_PASS_DURATION:.1f}s"
+                f"{elapsed:.1f}/{COIN_PICKUP_PASS_MAX_DURATION:.1f}s "
+                f"(missing {max(0.0, missing_for):.1f}/"
+                f"{COIN_PICKUP_CONFIRM_MISSING_DURATION:.1f}s)"
             )
 
         self.set_walking_direction(now, None)
@@ -2312,10 +2358,6 @@ class TwoLayerCombatController:
                 f"({horizontal_distance(player, target_coordinates):.0f}px)"
             )
 
-        pickup_pass_status = self.continue_coin_pickup_pass(now)
-        if pickup_pass_status is not None:
-            return pickup_pass_status
-
         detected_same_layer_coins = (
             monsters_on_platform(
                 self.current_player_platform,
@@ -2328,6 +2370,13 @@ class TwoLayerCombatController:
                 if coin_is_on_player_level(player, coin[0])
             ]
         )
+        pickup_pass_status = self.continue_coin_pickup_pass(
+            now,
+            detected_same_layer_coins,
+        )
+        if pickup_pass_status is not None:
+            return pickup_pass_status
+
         if self.current_layer == "upper" and detected_same_layer_coins:
             self.reset_upper_clear_confirmation()
         same_layer_coins = self.available_coin_targets(
@@ -2339,12 +2388,6 @@ class TwoLayerCombatController:
         if self.coin_target_direction is not None and locked_coin is None:
             missing_for = now - self.coin_target_last_seen_at
             direction = self.coin_target_direction
-            target_started_at = (
-                now
-                if self.coin_target_started_at is None
-                else self.coin_target_started_at
-            )
-            pursuit_elapsed = now - target_started_at
             reached_last_known_x = False
             if self.coin_target_coordinates is not None:
                 player_x, _player_y = coordinates_center(player)
@@ -2364,10 +2407,10 @@ class TwoLayerCombatController:
                 self.set_state("coin_pickup_pass", now)
                 return (
                     f"NESO: LAST POSITION REACHED; PICKUP PASS "
-                    f"{direction.upper()} 0.0/{COIN_PICKUP_PASS_DURATION:.1f}s"
+                    f"{direction.upper()} 0.0/{COIN_PICKUP_PASS_MAX_DURATION:.1f}s"
                 )
 
-            if pursuit_elapsed <= COIN_TARGET_BLIND_PURSUIT_MAX_DURATION:
+            if missing_for <= COIN_TARGET_BLIND_PURSUIT_MAX_DURATION:
                 self.set_walking_direction(now, direction)
                 self.facing_direction = direction
                 if missing_for <= COIN_TARGET_LOST_GRACE_DURATION:
@@ -2380,7 +2423,7 @@ class TwoLayerCombatController:
                 self.set_state("coin_target_blind_pursuit", now)
                 return (
                     f"NESO: BLIND PURSUIT {direction.upper()} "
-                    f"{pursuit_elapsed:.1f}/"
+                    f"{missing_for:.1f}/"
                     f"{COIN_TARGET_BLIND_PURSUIT_MAX_DURATION:.1f}s"
                 )
             self.reset_coin_target()
@@ -2412,21 +2455,14 @@ class TwoLayerCombatController:
 
             distance = horizontal_distance(player, target_coordinates)
             desired_direction = horizontal_direction_to(player, target_coordinates)
-            target_started_at = (
-                now
-                if self.coin_target_started_at is None
-                else self.coin_target_started_at
-            )
-            if (
-                desired_direction is not None
-                and desired_direction != direction
-                and now - target_started_at >= COIN_DIRECTION_LOCK_DURATION
-            ):
-                direction = desired_direction
-                self.coin_target_direction = direction
-                self.coin_target_started_at = now
 
+            # Once the player is close enough to collect the neso, preserve the
+            # approach direction. A rotating sprite can move the detected box
+            # center across the player for a few frames and must not cause an
+            # immediate reversal.
             if distance <= COIN_PICKUP_X_TOLERANCE:
+                self.coin_direction_candidate = None
+                self.coin_direction_candidate_started_at = None
                 if self.coin_pickup_pass_started_at is None:
                     self.coin_pickup_pass_started_at = now
                 self.set_walking_direction(now, direction)
@@ -2434,8 +2470,37 @@ class TwoLayerCombatController:
                 self.set_state("coin_pickup_pass", now)
                 return (
                     f"NESO: PICKUP PASS {direction.upper()} "
-                    f"0.0/{COIN_PICKUP_PASS_DURATION:.1f}s"
+                    f"0.0/{COIN_PICKUP_PASS_MAX_DURATION:.1f}s"
                 )
+
+            target_started_at = (
+                now
+                if self.coin_target_started_at is None
+                else self.coin_target_started_at
+            )
+            reversal_requested = (
+                desired_direction is not None
+                and desired_direction != direction
+                and distance >= COIN_DIRECTION_REVERSAL_DISTANCE
+                and now - target_started_at >= COIN_DIRECTION_LOCK_DURATION
+            )
+            if not reversal_requested:
+                self.coin_direction_candidate = None
+                self.coin_direction_candidate_started_at = None
+            elif self.coin_direction_candidate != desired_direction:
+                self.coin_direction_candidate = desired_direction
+                self.coin_direction_candidate_started_at = now
+            elif (
+                self.coin_direction_candidate_started_at is not None
+                and now - self.coin_direction_candidate_started_at
+                >= COIN_DIRECTION_CONFIRM_DURATION
+            ):
+                direction = desired_direction
+                self.coin_target_direction = direction
+                self.coin_target_started_at = now
+                self.coin_direction_candidate = None
+                self.coin_direction_candidate_started_at = None
+
             self.set_walking_direction(now, direction)
             self.facing_direction = direction
             self.set_state("move_to_coin", now)
@@ -2690,6 +2755,16 @@ def draw_player_labels(
     return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
 
+def print_key_bindings() -> None:
+    """Print a concise guide for every key sent to the game."""
+    print("按鍵：")
+    for key, description in KEY_BINDINGS:
+        print(f"  {key:<5} {description}")
+    print(
+        f"一般點按會按住 {DIRECTINPUT_KEY_HOLD * 1000:.0f}ms 後放開。"
+    )
+
+
 def main() -> None:
     pydirectinput.PAUSE = 0
     enable_dpi_awareness()
@@ -2759,7 +2834,8 @@ def main() -> None:
         f"MP 缺口 > {MP_DEFICIT_THRESHOLD} 按 {MP_POTION_KEY}"
     )
     print("DirectInput 只會在所選遊戲視窗位於前景時送出。")
-    print("按 Q 或 Esc 結束。")
+    print("按 Esc 結束。")
+    print_key_bindings()
 
     preview_title = "MapleStory YOLO Detection"
     if RENDER_PREVIEW_WINDOW:
@@ -3278,7 +3354,7 @@ def main() -> None:
                 cv2.imshow(preview_title, annotated)
 
                 key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), ord("Q"), 27):
+                if key == 27:
                     break
             else:
                 terminal_now = perf_counter()
