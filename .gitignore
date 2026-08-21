@@ -1,0 +1,25 @@
+ # Python virtual environment
+  .venv/
+  venv/
+
+  # Python cache
+  __pycache__/
+  *.py[cod]
+
+  # Runtime output
+  logs/
+  *.log
+
+  # Generated screenshots
+  manual/
+
+  # Secrets and local settings
+  .env
+  .env.*
+  !.env.example
+
+  # Editors and operating systems
+  .vscode/
+  .idea/
+  Thumbs.db
+  .DS_Store
