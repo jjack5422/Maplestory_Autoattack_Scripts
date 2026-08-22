@@ -40,7 +40,7 @@ IMAGE_SIZE = 960
 # Use "cpu" for CPU inference; use 0 for the first NVIDIA GPU.
 INFERENCE_DEVICE: str | int = 0
 CPU_INFERENCE_THREADS = 24
-RENDER_PREVIEW_WINDOW = True
+RENDER_PREVIEW_WINDOW = False
 SHOW_PLAYER_COORDINATES = True
 TERMINAL_STATUS_INTERVAL = 1.0
 OCR_INTERVAL = 0.25
@@ -129,6 +129,8 @@ RIGHT_KEY = "right"
 UP_KEY = "up"
 DOWN_KEY = "down"
 JUMP_KEY = "alt"
+ESCAPE_KEY = "esc"
+ENTER_KEY = "enter"
 
 LAYER_SPLIT_Y = 500
 UPPER_PLATFORM_SNAKE_THRESHOLD = 3
@@ -211,20 +213,19 @@ KEY_BINDINGS: tuple[tuple[str, str], ...] = (
     ("ALT", "跳躍、爬繩及下跳"),
 )
 
-# Hunt/rest cycle hyperparameters. Mouse positions are absolute screen coordinates.
+KEY_BINDINGS += (
+    ("ESC", "Open the logout menu during a scheduled break"),
+    ("ENTER", "Confirm logout and return after a scheduled break"),
+)
+
+# Pure-keyboard hunt/rest cycle hyperparameters.
 HUNT_DURATION_MINUTES = 30
 REST_DURATION_MINUTES = 2
-REST_MOUSE_SLOW_MOVE_DURATION = 0.80
-REST_POST_RETURN_MOVE_DURATION = 2.0
-REST_MOUSE_PARK_MOVE_DURATION = 2.0
-REST_MOUSE_STEP_DELAY = 1.0
-REST_MOUSE_DOUBLE_CLICK_INTERVAL = 0.10
-REST_MENU_FIRST_POSITION = (1276, 916)
-REST_MENU_SECOND_POSITION = (1269, 877)
-REST_MENU_THIRD_POSITION = (1012, 591)
-REST_RETURN_POSITION = (865, 613)
-REST_POST_RETURN_CLICK_POSITION = (1349, 882)
-REST_MOUSE_PARK_POSITION = (1605, 182)
+REST_LOGOUT_MENU_DELAY = 1.0
+REST_LOGOUT_CONFIRM_DELAY = 1.0
+REST_LOGOUT_FINAL_CONFIRM_DELAY = 1.0
+REST_LOGIN_ENTER_INTERVAL = 1.50
+REST_LOGIN_SETTLE_DURATION = 5.0
 
 # Scroll-template detection hyperparameters (detection only).
 SCROLL_TEMPLATE_DIRECTORY = ROOT / "assests" / "scroll"
@@ -253,6 +254,7 @@ class DirectInputController:
             {HP_POTION_KEY, MP_POTION_KEY, CRITICAL_HP_HEAL_KEY}
         ),
         "buff": frozenset(key for key, _interval in BUFF_SCHEDULES),
+        "menu": frozenset({ESCAPE_KEY, ENTER_KEY}),
     }
 
     def __init__(self, hwnd: int) -> None:
@@ -675,7 +677,7 @@ class TimedBuffController:
 
 
 class RestCycleController:
-    """Run the timed mouse-only rest sequence without blocking video processing."""
+    """Run the scheduled logout/login sequence using only keyboard input."""
 
     def __init__(
         self,
@@ -683,166 +685,172 @@ class RestCycleController:
         hunting_started_at: float,
     ) -> None:
         self.inputs = inputs
-        self._lock = Lock()
-        self._stop_event = Event()
         self._resume_ready = Event()
-        self._active = False
         self._closed = False
+        self._phase = "hunting"
+        self._phase_started_at = hunting_started_at
         self._status = "HUNTING"
         self._rest_ends_at: float | None = None
         self._next_rest_at = (
             hunting_started_at + HUNT_DURATION_MINUTES * 60.0
         )
-        self._worker: Thread | None = None
+        self._login_enter_target = 0
+        self._login_enter_count = 0
+        self._next_login_enter_at = 0.0
 
     @property
     def active(self) -> bool:
-        with self._lock:
-            return self._active
+        return self._phase != "hunting"
 
     @property
     def resume_ready(self) -> bool:
         return self._resume_ready.is_set()
 
     def status(self, now: float) -> str:
-        with self._lock:
-            status = self._status
-            rest_ends_at = self._rest_ends_at
-        if rest_ends_at is not None:
-            remaining = max(0.0, rest_ends_at - now)
+        if self._rest_ends_at is not None:
+            remaining = max(0.0, self._rest_ends_at - now)
             return f"RESTING: {remaining:.0f}s remaining"
-        return status
+        return self._status
 
     def update(self, now: float) -> None:
-        if not self.inputs.has_focus():
+        if self._closed or self._resume_ready.is_set():
             return
-        with self._lock:
-            if self._closed or self._active or now < self._next_rest_at:
-                return
-            self._active = True
-            self._status = "REST: preparing mouse sequence"
 
-        print("[REST] Hunt duration reached; keyboard input is now paused.", flush=True)
-        self.inputs.set_paused(True)
-        self._worker = Thread(
-            target=self._run_mouse_sequence,
-            name="rest-mouse-sequence",
-            daemon=True,
-        )
-        self._worker.start()
+        if self._phase == "hunting":
+            if now < self._next_rest_at or not self.inputs.has_focus():
+                return
+            self.inputs.release_all()
+            if self.inputs.tap(ESCAPE_KEY):
+                self._set_phase(
+                    "logout_menu",
+                    now,
+                    "REST: opening logout menu",
+                )
+                print(
+                    "[REST] Hunt duration reached; starting keyboard logout.",
+                    flush=True,
+                )
+            return
+
+        if self._phase == "offline":
+            remaining = REST_DURATION_MINUTES * 60.0 - (
+                now - self._phase_started_at
+            )
+            if remaining > 0:
+                self._status = f"RESTING: {remaining:.0f}s remaining"
+                return
+
+            self._rest_ends_at = None
+            self._login_enter_target = random.choice((2, 3))
+            self._login_enter_count = 0
+            self._next_login_enter_at = now
+            self._set_phase("login", now, "LOGIN: preparing keyboard login")
+
+        if not self.inputs.has_focus():
+            self._status = f"{self._phase.upper()}: waiting for game focus"
+            return
+
+        self.inputs.release_all()
+
+        if self._phase == "logout_menu":
+            if now - self._phase_started_at < REST_LOGOUT_MENU_DELAY:
+                self._status = "REST: waiting for logout menu"
+                return
+            if self.inputs.tap(UP_KEY):
+                self._set_phase(
+                    "logout_confirm",
+                    now,
+                    "REST: selecting offline",
+                )
+            return
+
+        if self._phase == "logout_confirm":
+            if now - self._phase_started_at < REST_LOGOUT_CONFIRM_DELAY:
+                self._status = "REST: waiting to confirm offline"
+                return
+            if self.inputs.tap(ENTER_KEY):
+                self._set_phase(
+                    "logout_final_confirm",
+                    now,
+                    "REST: opening offline confirmation",
+                )
+            return
+
+        if self._phase == "logout_final_confirm":
+            if (
+                now - self._phase_started_at
+                < REST_LOGOUT_FINAL_CONFIRM_DELAY
+            ):
+                self._status = "REST: waiting for offline confirmation"
+                return
+            if self.inputs.tap(ENTER_KEY):
+                self._set_phase("offline", now, "RESTING")
+                self._rest_ends_at = now + REST_DURATION_MINUTES * 60.0
+            return
+
+        if self._phase == "login":
+            if (
+                self._login_enter_count < self._login_enter_target
+                and now >= self._next_login_enter_at
+                and self.inputs.tap(ENTER_KEY)
+            ):
+                self._login_enter_count += 1
+                self._next_login_enter_at = (
+                    now + REST_LOGIN_ENTER_INTERVAL
+                )
+
+            if self._login_enter_count < self._login_enter_target:
+                self._status = (
+                    "LOGIN: ENTER "
+                    f"{self._login_enter_count}/{self._login_enter_target}"
+                )
+                return
+
+            self._set_phase(
+                "login_settle",
+                now,
+                "LOGIN: waiting for game",
+            )
+            return
+
+        if self._phase == "login_settle":
+            remaining = REST_LOGIN_SETTLE_DURATION - (
+                now - self._phase_started_at
+            )
+            if remaining > 0:
+                self._status = f"LOGIN: settling {remaining:.1f}s"
+                return
+            self._status = "REST: ready to resume"
+            self._resume_ready.set()
+            return
+
+        raise RuntimeError(f"Unknown rest-cycle phase: {self._phase}")
 
     def resume_hunting(self, now: float) -> None:
         if not self._resume_ready.is_set():
             return
-        with self._lock:
-            if self._closed:
-                return
-            self._active = False
-            self._status = "HUNTING"
-            self._rest_ends_at = None
-            self._next_rest_at = now + HUNT_DURATION_MINUTES * 60.0
+        if self._closed:
+            return
+        self._phase = "hunting"
+        self._phase_started_at = now
+        self._status = "HUNTING"
+        self._rest_ends_at = None
+        self._next_rest_at = now + HUNT_DURATION_MINUTES * 60.0
+        self._login_enter_target = 0
+        self._login_enter_count = 0
+        self._next_login_enter_at = 0.0
         self._resume_ready.clear()
-        self.inputs.set_paused(False)
         print("[REST] Rest complete; keyboard input and hunting resumed.", flush=True)
 
     def shutdown(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        self._stop_event.set()
-        worker = self._worker
-        if worker is not None and worker.is_alive():
-            worker.join(timeout=2.0)
+        self._closed = True
+        self._resume_ready.clear()
+        self.inputs.release_all()
 
-    def _wait(self, duration: float) -> bool:
-        return not self._stop_event.wait(duration)
-
-    def _set_status(self, status: str) -> None:
-        with self._lock:
-            self._status = status
-
-    def _move_and_click(
-        self,
-        position: tuple[int, int],
-        status: str,
-        clicks: int = 1,
-    ) -> bool:
-        if self._stop_event.is_set():
-            return False
-        self._set_status(status)
-        pydirectinput.moveTo(
-            position[0],
-            position[1],
-            duration=REST_MOUSE_SLOW_MOVE_DURATION,
-        )
-        if self._stop_event.is_set():
-            return False
-        pydirectinput.click(
-            button="left",
-            clicks=clicks,
-            interval=REST_MOUSE_DOUBLE_CLICK_INTERVAL if clicks > 1 else 0.0,
-        )
-        return self._wait(REST_MOUSE_STEP_DELAY)
-
-    def _run_mouse_sequence(self) -> None:
-        try:
-            if not self._move_and_click(
-                REST_MENU_FIRST_POSITION,
-                "REST: mouse step 1/5",
-            ):
-                return
-            if not self._move_and_click(
-                REST_MENU_SECOND_POSITION,
-                "REST: mouse step 2/5",
-            ):
-                return
-            if not self._move_and_click(
-                REST_MENU_THIRD_POSITION,
-                "REST: mouse step 3/5",
-            ):
-                return
-
-            rest_duration = REST_DURATION_MINUTES * 60.0
-            with self._lock:
-                self._rest_ends_at = perf_counter() + rest_duration
-                self._status = "RESTING"
-            if not self._wait(rest_duration):
-                return
-            with self._lock:
-                self._rest_ends_at = None
-
-            if not self._move_and_click(
-                REST_RETURN_POSITION,
-                "REST: returning to game",
-                clicks=2,
-            ):
-                return
-
-            self._set_status("REST: post-return click")
-            pydirectinput.moveTo(
-                REST_POST_RETURN_CLICK_POSITION[0],
-                REST_POST_RETURN_CLICK_POSITION[1],
-                duration=REST_POST_RETURN_MOVE_DURATION,
-            )
-            if self._stop_event.is_set():
-                return
-            pydirectinput.click(button="left")
-
-            self._set_status("REST: parking mouse")
-            pydirectinput.moveTo(
-                REST_MOUSE_PARK_POSITION[0],
-                REST_MOUSE_PARK_POSITION[1],
-                duration=REST_MOUSE_PARK_MOVE_DURATION,
-            )
-        except Exception as error:
-            print(f"[REST] Mouse sequence failed: {error}", flush=True)
-        finally:
-            if not self._stop_event.is_set():
-                with self._lock:
-                    self._rest_ends_at = None
-                    self._status = "REST: ready to resume"
-                self._resume_ready.set()
+    def _set_phase(self, phase: str, now: float, status: str) -> None:
+        self._phase = phase
+        self._phase_started_at = now
+        self._status = status
 
 
 @dataclass(frozen=True)
