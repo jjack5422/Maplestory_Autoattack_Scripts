@@ -2,6 +2,7 @@ import atexit
 import ctypes
 import random
 import re
+import winsound
 from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ import cv2
 import numpy as np
 import pydirectinput
 import torch
-from mss import mss
+from mss import MSS
 from PIL import Image, ImageDraw, ImageFont
 from rapidocr import RapidOCR
 from ultralytics import YOLO
@@ -46,12 +47,13 @@ TERMINAL_STATUS_INTERVAL = 1.0
 OCR_INTERVAL = 0.25
 OCR_CONFIDENCE = 0.60
 OCR_FONT_PATH = Path("C:/Windows/Fonts/msjhbd.ttc")
-MY_PLAYER_NAME = "黑暗打法師"
+MY_PLAYER_NAME = "阿罵的手機"
 NAME_MATCH_THRESHOLD = 0.80
 
 # Pixel templates for identifying the local player's eyes whenever the name
 # below the character is obscured by platform grass.
 PLAYER_EYE_TEMPLATE_DIRECTORY = ROOT / "character"
+PLAYER_EYE_TEMPLATE_GLOB = f"{MY_PLAYER_NAME}*.png"
 PLAYER_EYE_MATCH_THRESHOLD = 0.88
 PLAYER_EYE_MAX_MEAN_COLOR_ERROR = 45.0
 PLAYER_EYE_AMBIGUITY_MARGIN = 0.08
@@ -131,6 +133,8 @@ DOWN_KEY = "down"
 JUMP_KEY = "alt"
 ESCAPE_KEY = "esc"
 ENTER_KEY = "enter"
+SKILL_BAR_TOGGLE_MODIFIER_KEY = "shift"
+SKILL_BAR_TOGGLE_KEY = "]"
 
 LAYER_SPLIT_Y = 500
 UPPER_PLATFORM_SNAKE_THRESHOLD = 3
@@ -185,7 +189,7 @@ PLAYER_STATIONARY_MOVEMENT_THRESHOLD = 10
 # Resource automation hyperparameters.
 RESOURCE_OCR_INTERVAL = 0.25
 HP_POTION_KEY = "1"
-CRITICAL_HP_THRESHOLD = 300
+CRITICAL_HP_THRESHOLD = 400
 CRITICAL_HP_HEAL_KEY = "e"
 CRITICAL_HP_HEAL_INTERVAL = 0.25
 CRITICAL_HP_FALLBACK_DELAY = 1.00
@@ -226,6 +230,7 @@ REST_LOGOUT_CONFIRM_DELAY = 1.0
 REST_LOGOUT_FINAL_CONFIRM_DELAY = 1.0
 REST_LOGIN_ENTER_INTERVAL = 1.50
 REST_LOGIN_SETTLE_DURATION = 5.0
+REST_SKILL_BAR_TOGGLE_SETTLE_DURATION = 0.30
 
 # Scroll-template detection hyperparameters (detection only).
 SCROLL_TEMPLATE_DIRECTORY = ROOT / "assests" / "scroll"
@@ -235,6 +240,12 @@ SCROLL_TEMPLATE_MATCH_THRESHOLD = 0.92
 SCROLL_MAX_MEAN_COLOR_ERROR = 35.0
 SCROLL_MAX_MATCHES_PER_TEMPLATE = 5
 SCROLL_NMS_THRESHOLD = 0.30
+
+# OCR-based lie-detector recognition.  It matches the dialog title rather
+# than pixels, so it tolerates image scaling and browser rendering differences.
+LIE_DETECTOR_OCR_INTERVAL = 1.0
+LIE_DETECTOR_OCR_CONFIDENCE = 0.80
+LIE_DETECTOR_TITLE = "LIEDETECTOR"
 
 user32 = ctypes.windll.user32
 user32.GetForegroundWindow.argtypes = ()
@@ -254,7 +265,14 @@ class DirectInputController:
             {HP_POTION_KEY, MP_POTION_KEY, CRITICAL_HP_HEAL_KEY}
         ),
         "buff": frozenset(key for key, _interval in BUFF_SCHEDULES),
-        "menu": frozenset({ESCAPE_KEY, ENTER_KEY}),
+        "menu": frozenset(
+            {
+                ESCAPE_KEY,
+                ENTER_KEY,
+                SKILL_BAR_TOGGLE_MODIFIER_KEY,
+                SKILL_BAR_TOGGLE_KEY,
+            }
+        ),
     }
 
     def __init__(self, hwnd: int) -> None:
@@ -344,6 +362,20 @@ class DirectInputController:
             self._pending_taps.add(key)
         command_queue.put(("tap", key))
         return True
+
+    def tap_shifted(self, key: str) -> bool:
+        """Queue Shift+key on one worker so the chord order is preserved."""
+        if (
+            self._command_queue_for(key) is not self._commands.get("menu")
+            or not self.has_focus()
+        ):
+            return False
+        if not self.key_down(SKILL_BAR_TOGGLE_MODIFIER_KEY):
+            return False
+        try:
+            return self.tap(key)
+        finally:
+            self.key_up(SKILL_BAR_TOGGLE_MODIFIER_KEY)
 
     def tap_attack(self, direction: str, attack_key: str) -> bool:
         """Tap a facing direction, then tap the requested monster skill."""
@@ -741,7 +773,7 @@ class RestCycleController:
                 return
 
             self._rest_ends_at = None
-            self._login_enter_target = random.choice((2, 3))
+            self._login_enter_target = 1
             self._login_enter_count = 0
             self._next_login_enter_at = now
             self._set_phase("login", now, "LOGIN: preparing keyboard login")
@@ -820,6 +852,21 @@ class RestCycleController:
             if remaining > 0:
                 self._status = f"LOGIN: settling {remaining:.1f}s"
                 return
+            if self.inputs.tap_shifted(SKILL_BAR_TOGGLE_KEY):
+                self._set_phase(
+                    "skill_bar_toggle",
+                    now,
+                    "LOGIN: collapsing skill bar with }",
+                )
+            return
+
+        if self._phase == "skill_bar_toggle":
+            remaining = REST_SKILL_BAR_TOGGLE_SETTLE_DURATION - (
+                now - self._phase_started_at
+            )
+            if remaining > 0:
+                self._status = "LOGIN: waiting for skill bar to collapse"
+                return
             self._status = "REST: ready to resume"
             self._resume_ready.set()
             return
@@ -884,9 +931,10 @@ class PlayerEyeMatch:
 
 def load_player_eye_templates(
     directory: Path,
+    filename_pattern: str,
 ) -> list[PlayerEyeTemplate]:
     templates = []
-    for path in sorted(directory.glob("*.png")):
+    for path in sorted(directory.glob(filename_pattern)):
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None or image.ndim != 3 or image.shape[2] != 3:
             raise RuntimeError(f"Unable to load player-eye template: {path}")
@@ -895,7 +943,8 @@ def load_player_eye_templates(
         templates.append(PlayerEyeTemplate(path.stem, image))
     if not templates:
         raise RuntimeError(
-            f"No player-eye PNG templates found in: {directory}"
+            "No player-eye PNG templates found: "
+            f"{directory / filename_pattern}"
         )
     return templates
 
@@ -1000,6 +1049,146 @@ def find_player_eye_match(
     ):
         return None
     return player_matches[0]
+
+
+def is_lie_detector_text(text: str, confidence: float) -> bool:
+    normalized = "".join(character for character in text.upper() if character.isalnum())
+    return (
+        confidence >= LIE_DETECTOR_OCR_CONFIDENCE
+        and LIE_DETECTOR_TITLE in normalized
+    )
+
+
+class LieDetectorOcr:
+    """Recognize the dialog title off the input thread."""
+
+    def __init__(self) -> None:
+        self._detected = False
+        self._next_scan_at = 0.0
+        self._scan_pending = False
+        self._last_error: Exception | None = None
+        self._lock = Lock()
+        self._commands: Queue[tuple[str, object]] = Queue(maxsize=1)
+        self._stop_event = Event()
+        self._closed = False
+        self._worker = Thread(
+            target=self._worker_loop,
+            name="lie-detector-ocr-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def update(self, frame: np.ndarray, now: float) -> bool:
+        with self._lock:
+            if self._last_error is not None:
+                error = self._last_error
+                self._last_error = None
+                raise RuntimeError("Lie-detector OCR worker failed") from error
+
+            detected = self._detected
+            should_scan = (
+                not self._closed
+                and not self._scan_pending
+                and now >= self._next_scan_at
+            )
+            if should_scan:
+                self._scan_pending = True
+
+        if should_scan:
+            self._commands.put(("scan", (frame.copy(), now)))
+        return detected
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._stop_event.set()
+        try:
+            self._commands.put_nowait(("stop", None))
+        except Full:
+            pass
+        if self._worker.is_alive():
+            self._worker.join(timeout=1.0)
+
+    def _worker_loop(self) -> None:
+        ocr = RapidOCR()
+        while not self._stop_event.is_set():
+            action, payload = self._commands.get()
+            if action == "stop" or payload is None or self._stop_event.is_set():
+                break
+
+            frame, scan_started_at = payload
+            try:
+                result = ocr(
+                    frame,
+                    use_det=True,
+                    use_cls=False,
+                    use_rec=True,
+                )
+                detected = any(
+                    is_lie_detector_text(text, float(confidence))
+                    for text, confidence in zip(result.txts, result.scores)
+                )
+                with self._lock:
+                    self._detected = detected
+                    self._next_scan_at = (
+                        scan_started_at + LIE_DETECTOR_OCR_INTERVAL
+                    )
+            except Exception as error:
+                with self._lock:
+                    self._last_error = error
+                    self._next_scan_at = (
+                        perf_counter() + LIE_DETECTOR_OCR_INTERVAL
+                    )
+            finally:
+                with self._lock:
+                    self._scan_pending = False
+
+
+class LieDetectorAlarm:
+    """Emit a repeating two-tone alarm while the detector dialog is visible."""
+
+    def __init__(self) -> None:
+        self._sounding = False
+        self._stop_event = Event()
+        self._worker: Thread | None = None
+        self._lock = Lock()
+
+    def update(self, detected: bool) -> None:
+        with self._lock:
+            if detected == self._sounding:
+                return
+            self._sounding = detected
+            if detected:
+                self._stop_event.clear()
+                self._worker = Thread(
+                    target=self._alarm_loop,
+                    name="lie-detector-alarm",
+                    daemon=True,
+                )
+                self._worker.start()
+                message = "[ALERT] 偵測到測謊視窗，已啟動雙音鬧鐘警報。"
+            else:
+                self._stop_event.set()
+                worker = self._worker
+                self._worker = None
+                message = "[ALERT] 測謊視窗已消失，已停止警報聲。"
+
+        if not detected and worker is not None and worker.is_alive():
+            worker.join(timeout=1.0)
+        print(message, flush=True)
+
+    def shutdown(self) -> None:
+        self.update(False)
+
+    def _alarm_loop(self) -> None:
+        while not self._stop_event.is_set():
+            winsound.Beep(1200, 300)
+            if self._stop_event.wait(0.08):
+                break
+            winsound.Beep(1600, 300)
+            self._stop_event.wait(0.10)
 
 
 def load_scroll_templates(directory: Path) -> list[ScrollTemplate]:
@@ -3121,8 +3310,11 @@ def main() -> None:
     scroll_detector = ScrollDetector(
         load_scroll_templates(SCROLL_TEMPLATE_DIRECTORY)
     )
+    lie_detector_ocr = LieDetectorOcr()
+    lie_detector_alarm = LieDetectorAlarm()
     player_eye_templates = load_player_eye_templates(
-        PLAYER_EYE_TEMPLATE_DIRECTORY
+        PLAYER_EYE_TEMPLATE_DIRECTORY,
+        PLAYER_EYE_TEMPLATE_GLOB,
     )
     ocr = RapidOCR()
     ocr_font = ImageFont.truetype(str(OCR_FONT_PATH), 24)
@@ -3141,6 +3333,7 @@ def main() -> None:
     player_tracker = PlayerTracker()
     last_resource_ocr_time = 0.0
     last_terminal_status_time = float("-inf")
+    lie_detector_detected = False
     hp_stat: tuple[int, int] | None = None
     mp_stat: tuple[int, int] | None = None
     critical_hp_active = False
@@ -3156,6 +3349,11 @@ def main() -> None:
         f"MP 缺口 > {MP_DEFICIT_THRESHOLD} 按 {MP_POTION_KEY}"
     )
     print("DirectInput 只會在所選遊戲視窗位於前景時送出。")
+    print(
+        f"測謊警報：每 {LIE_DETECTOR_OCR_INTERVAL:.1f} 秒背景 OCR "
+        f"偵測「LIE DETECTOR」，信心門檻 "
+        f"{LIE_DETECTOR_OCR_CONFIDENCE:.2f}"
+    )
     print("按 Esc 結束。")
     print_key_bindings()
 
@@ -3189,6 +3387,8 @@ def main() -> None:
     atexit.register(scroll_detector.shutdown)
     atexit.register(rest_controller.shutdown)
     atexit.register(buff_controller.shutdown)
+    atexit.register(lie_detector_alarm.shutdown)
+    atexit.register(lie_detector_ocr.shutdown)
     print(
         f"Automatic pickup starts after {AUTOMATION_START_DELAY:.1f}s; "
         f"{AUTO_PICKUP_KEY.upper()} every {AUTO_PICKUP_INTERVAL:.2f}s"
@@ -3212,7 +3412,7 @@ def main() -> None:
         f"rest {REST_DURATION_MINUTES} minute(s)."
     )
 
-    with mss() as screen:
+    with MSS() as screen:
         while True:
             region = get_client_region(hwnd)
             if region is None:
@@ -3233,6 +3433,8 @@ def main() -> None:
 
             frame = np.asarray(screen.grab(region))[:, :, :3]
             scroll_matches = scroll_detector.update(frame, perf_counter())
+            lie_detector_detected = lie_detector_ocr.update(frame, started)
+            lie_detector_alarm.update(lie_detector_detected)
 
             pickup_now = perf_counter()
             if (
@@ -3776,6 +3978,8 @@ def main() -> None:
     rest_controller.shutdown()
     input_controller.shutdown()
     scroll_detector.shutdown()
+    lie_detector_alarm.shutdown()
+    lie_detector_ocr.shutdown()
     if RENDER_PREVIEW_WINDOW:
         cv2.destroyAllWindows()
 
