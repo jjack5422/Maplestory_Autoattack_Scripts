@@ -197,8 +197,10 @@ CRITICAL_HP_FALLBACK_INTERVAL = 0.25
 MP_DEFICIT_THRESHOLD = 1000
 MP_POTION_KEY = "2"
 
-HP_ROI_OFFSETS = (-183, -104, -35, -15)
-MP_ROI_OFFSETS = (-73, 7, -35, -15)
+# New HUD layout (bottom-center anchored). Include the HP/MP label and the
+# complete current/max value so recognition is not truncated at either edge.
+HP_ROI_OFFSETS = (-218, -126, -36, -16)
+MP_ROI_OFFSETS = (-49, 44, -36, -16)
 RESOURCE_OCR_SCALE = 5
 DIRECTINPUT_KEY_HOLD = 0.060
 
