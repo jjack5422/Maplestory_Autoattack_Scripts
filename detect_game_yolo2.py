@@ -248,6 +248,9 @@ SCROLL_NMS_THRESHOLD = 0.30
 LIE_DETECTOR_OCR_INTERVAL = 1.0
 LIE_DETECTOR_OCR_CONFIDENCE = 0.80
 LIE_DETECTOR_TITLE = "LIEDETECTOR"
+# Normalized coordinates (left, right, top, bottom) for the centered dialog's
+# title area. Ratios keep the ROI usable across different client resolutions.
+LIE_DETECTOR_ROI = (0.22, 0.78, 0.15, 0.32)
 
 user32 = ctypes.windll.user32
 user32.GetForegroundWindow.argtypes = ()
@@ -1061,8 +1064,21 @@ def is_lie_detector_text(text: str, confidence: float) -> bool:
     )
 
 
+def crop_lie_detector_roi(frame: np.ndarray) -> np.ndarray:
+    """Crop the approximate lie-detector title region using frame ratios."""
+    frame_height, frame_width = frame.shape[:2]
+    left, right, top, bottom = LIE_DETECTOR_ROI
+    x1 = max(0, min(frame_width, int(round(frame_width * left))))
+    x2 = max(0, min(frame_width, int(round(frame_width * right))))
+    y1 = max(0, min(frame_height, int(round(frame_height * top))))
+    y2 = max(0, min(frame_height, int(round(frame_height * bottom))))
+    if x1 >= x2 or y1 >= y2:
+        raise ValueError("Lie-detector OCR ROI is empty")
+    return frame[y1:y2, x1:x2]
+
+
 class LieDetectorOcr:
-    """Recognize the dialog title off the input thread."""
+    """Recognize the dialog title ROI off the input thread."""
 
     def __init__(self) -> None:
         self._detected = False
@@ -1097,7 +1113,8 @@ class LieDetectorOcr:
                 self._scan_pending = True
 
         if should_scan:
-            self._commands.put(("scan", (frame.copy(), now)))
+            roi = crop_lie_detector_roi(frame)
+            self._commands.put(("scan", (roi.copy(), now)))
         return detected
 
     def shutdown(self) -> None:
